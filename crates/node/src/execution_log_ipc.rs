@@ -208,3 +208,7 @@ fn encode_v3(event: &ExecutionLogEvent) -> Option<Vec<u8>> {
     frame.extend(body);
     Some(frame)
 }
+
+#[cfg(test)]
+#[path = "execution_log_ipc_tests.rs"]
+mod tests;
