@@ -152,6 +152,14 @@ fn follow_url_for_consensus(
 
 #[derive(Debug, Args)]
 struct ArcExtraCli {
+    /// Emit committed transactions from Engine payload execution to a Unix socket.
+    #[arg(long = "execution-log-ipc", value_name = "PATH")]
+    execution_log_ipc: Option<std::path::PathBuf>,
+
+    /// Unix socket mode for --execution-log-ipc (octal, default 0660).
+    #[arg(long = "execution-log-ipc-permissions", value_name = "MODE", default_value = "0660", value_parser = parse_socket_mode)]
+    execution_log_ipc_permissions: u32,
+
     /// Enable custom ARC RPC namespace (certificates etc.).
     #[arg(long = "enable-arc-rpc", default_value_t = false)]
     enable_arc_rpc: bool,
@@ -602,6 +610,17 @@ fn main() {
             // Register version information in metrics
             arc_node_execution::metrics::register_version_info();
 
+            let execution_log_sink = match ext.execution_log_ipc {
+                Some(ref path) => Some(
+                    arc_node_execution::execution_log_ipc::start(
+                        path.clone(),
+                        ext.execution_log_ipc_permissions,
+                    )
+                    .await?,
+                ),
+                None => None,
+            };
+
             let wait_for_payload = ext.wait_for_payload;
             let filter_pending_txs = compute_filter_pending_txs(&ext);
             let allow_unprotected_txs = ext.arc_rpc_allow_unprotected_txs;
@@ -611,21 +630,25 @@ fn main() {
             let tx_relay_timeout = ext.arc_tx_relays_timeout;
             let rebroadcast_interval =
                 std::time::Duration::from_secs(ext.txpool_rebroadcast_interval);
+            let mut arc_node = ArcNode::new(
+                arc_rpc_cfg,
+                invalid_tx_list_cfg,
+                addresses_denylist_config,
+                payload_builder_deadline_ms,
+                wait_for_payload,
+                filter_pending_txs,
+                allow_unprotected_txs,
+                max_response_body_size,
+                max_batch_entries,
+                rebroadcast_interval,
+                tx_relays,
+                tx_relay_timeout,
+            );
+            if let Some(sink) = execution_log_sink {
+                arc_node = arc_node.with_execution_log_sink(sink);
+            }
             let handle = builder
-                .node(ArcNode::new(
-                    arc_rpc_cfg,
-                    invalid_tx_list_cfg,
-                    addresses_denylist_config,
-                    payload_builder_deadline_ms,
-                    wait_for_payload,
-                    filter_pending_txs,
-                    allow_unprotected_txs,
-                    max_response_body_size,
-                    max_batch_entries,
-                    rebroadcast_interval,
-                    tx_relays,
-                    tx_relay_timeout,
-                ))
+                .node(arc_node)
                 .launch_with_debug_capabilities()
                 .await?;
 
@@ -640,6 +663,11 @@ fn main() {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
     }
+}
+
+fn parse_socket_mode(value: &str) -> Result<u32, String> {
+    let digits = value.strip_prefix("0o").unwrap_or(value);
+    u32::from_str_radix(digits, 8).map_err(|error| format!("invalid octal socket mode: {error}"))
 }
 
 /// Install a SIGTERM handler to gracefully shutdown the engine.
@@ -1113,6 +1141,21 @@ mod tests {
             Commands::Node(cmd) => cmd.ext,
             _ => panic!("Expected Node command"),
         }
+    }
+
+    #[test]
+    fn execution_log_ipc_flags_parse_path_and_octal_permissions() {
+        let ext = ext_from_args([
+            "--execution-log-ipc",
+            "/tmp/execution-log.sock",
+            "--execution-log-ipc-permissions",
+            "0600",
+        ]);
+        assert_eq!(
+            ext.execution_log_ipc,
+            Some(std::path::PathBuf::from("/tmp/execution-log.sock"))
+        );
+        assert_eq!(ext.execution_log_ipc_permissions, 0o600);
     }
 
     /// The denylist must not be operator-configurable: disabling it or repointing it at a

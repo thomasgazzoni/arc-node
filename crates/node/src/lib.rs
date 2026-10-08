@@ -23,6 +23,7 @@ mod args;
 
 pub use args::patch_node_command_defaults;
 
+pub mod execution_log_ipc;
 pub mod metrics;
 
 // Re-export commonly used types
