@@ -17,6 +17,7 @@
 extern crate alloc;
 
 use crate::assembler::ArcBlockAssembler;
+use crate::execution_log::ExecutionLogSink;
 use crate::executor::ArcBlockExecutor;
 use crate::frame_result::{create_frame_result, create_oog_frame_result, BeforeFrameInitResult};
 use crate::log::create_eip7708_transfer_log;
@@ -38,6 +39,7 @@ use arc_precompiles::helpers::{
 };
 use arc_precompiles::NATIVE_COIN_CONTROL_ADDRESS;
 use core::fmt::Debug;
+use core::ops::{Deref, DerefMut};
 use reth_ethereum::evm::revm::context::block::BlockEnv;
 use reth_ethereum::evm::revm::primitives::U256;
 use reth_ethereum::{
@@ -88,6 +90,46 @@ use revm_interpreter::interpreter_action::FrameInit;
 use revm_interpreter::{CallScheme, CreateScheme, FrameInput, Instruction};
 use revm_primitives::{Address, Bytes};
 use std::collections::{HashMap, HashSet};
+
+/// The path that created a block execution context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArcExecutionOrigin {
+    EnginePayload,
+    BlockReexecution,
+    PayloadBuilder,
+}
+
+/// Arc metadata attached to the ordinary Ethereum execution context.
+#[derive(Debug, Clone)]
+pub struct ArcBlockExecutionCtx<'a> {
+    pub inner: EthBlockExecutionCtx<'a>,
+    pub block_hash: Option<alloy_primitives::B256>,
+    pub origin: ArcExecutionOrigin,
+}
+
+impl<'a> Deref for ArcBlockExecutionCtx<'a> {
+    type Target = EthBlockExecutionCtx<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<'a> DerefMut for ArcBlockExecutionCtx<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<'a> From<EthBlockExecutionCtx<'a>> for ArcBlockExecutionCtx<'a> {
+    fn from(inner: EthBlockExecutionCtx<'a>) -> Self {
+        Self {
+            inner,
+            block_hash: None,
+            origin: ArcExecutionOrigin::PayloadBuilder,
+        }
+    }
+}
 
 use crate::handler::ArcEvmHandler;
 use crate::opcode::{
@@ -1763,6 +1805,7 @@ pub struct ArcEvmConfig {
     pub(crate) inner: EthEvmConfig<ArcChainSpec, ArcEvmFactory>,
     pub(crate) evm_factory_instance: ArcEvmFactory,
     pub(crate) block_assembler: ArcBlockAssembler<ArcChainSpec>,
+    pub(crate) execution_log_sink: Option<Arc<dyn ExecutionLogSink>>,
 }
 
 impl ArcEvmConfig {
@@ -1774,13 +1817,20 @@ impl ArcEvmConfig {
             inner,
             evm_factory_instance,
             block_assembler: ArcBlockAssembler::new(chain_spec.clone()),
+            execution_log_sink: None,
         }
+    }
+
+    /// Attach a nonblocking transaction execution observer.
+    pub fn with_execution_log_sink(mut self, sink: Arc<dyn ExecutionLogSink>) -> Self {
+        self.execution_log_sink = Some(sink);
+        self
     }
 }
 
 impl BlockExecutorFactory for ArcEvmConfig {
     type EvmFactory = ArcEvmFactory;
-    type ExecutionCtx<'a> = EthBlockExecutionCtx<'a>;
+    type ExecutionCtx<'a> = ArcBlockExecutionCtx<'a>;
     type Transaction = TransactionSigned;
     type Receipt = Receipt;
     type TxExecutionResult = crate::executor::ArcTxResult<
@@ -1801,7 +1851,7 @@ impl BlockExecutorFactory for ArcEvmConfig {
     fn create_executor<'a, DB, I>(
         &'a self,
         evm: <Self::EvmFactory as EvmFactory>::Evm<DB, I>,
-        ctx: EthBlockExecutionCtx<'a>,
+        ctx: ArcBlockExecutionCtx<'a>,
     ) -> Self::Executor<'a, DB, I>
     where
         DB: StateDB,
@@ -1813,6 +1863,7 @@ impl BlockExecutorFactory for ArcEvmConfig {
             self.inner.chain_spec(),
             self.inner.executor_factory.receipt_builder(),
         )
+        .with_execution_log_sink(self.execution_log_sink.clone())
     }
 }
 
@@ -1887,19 +1938,27 @@ impl ConfigureEvm for ArcEvmConfig {
     fn context_for_block<'a>(
         &self,
         block: &'a SealedBlock<reth_ethereum::Block>,
-    ) -> Result<EthBlockExecutionCtx<'a>, Self::Error> {
-        self.inner.context_for_block(block)
+    ) -> Result<ArcBlockExecutionCtx<'a>, Self::Error> {
+        Ok(ArcBlockExecutionCtx {
+            inner: self.inner.context_for_block(block)?,
+            block_hash: Some(block.hash()),
+            origin: ArcExecutionOrigin::BlockReexecution,
+        })
     }
 
     fn context_for_next_block(
         &self,
         parent: &SealedHeader,
         attributes: Self::NextBlockEnvCtx,
-    ) -> Result<EthBlockExecutionCtx<'_>, Self::Error> {
+    ) -> Result<ArcBlockExecutionCtx<'_>, Self::Error> {
         let mut ctx = self.inner.context_for_next_block(parent, attributes)?;
         // Clearing extra_data as the executor will supply it after execution.
         ctx.extra_data = Default::default();
-        Ok(ctx)
+        Ok(ArcBlockExecutionCtx {
+            inner: ctx,
+            block_hash: None,
+            origin: ArcExecutionOrigin::PayloadBuilder,
+        })
     }
 }
 
@@ -1912,7 +1971,11 @@ impl ConfigureEngineEvm<ExecutionData> for ArcEvmConfig {
         &self,
         payload: &'a ExecutionData,
     ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
-        self.inner.context_for_payload(payload)
+        Ok(ArcBlockExecutionCtx {
+            inner: self.inner.context_for_payload(payload)?,
+            block_hash: Some(payload.block_hash()),
+            origin: ArcExecutionOrigin::EnginePayload,
+        })
     }
 
     fn tx_iterator_for_payload(
@@ -3410,6 +3473,8 @@ mod tests {
             "context_for_payload must preserve extra_data from the payload — \
              the executor relies on it being non-empty to trigger base fee validation"
         );
+        assert_eq!(ctx.origin, ArcExecutionOrigin::EnginePayload);
+        assert_eq!(ctx.block_hash, Some(B256::ZERO));
     }
 
     #[test]
@@ -3448,6 +3513,8 @@ mod tests {
             "context_for_next_block must clear extra_data so the executor's \
              base fee validation gate does not fire during block building or simulation"
         );
+        assert_eq!(ctx.origin, ArcExecutionOrigin::PayloadBuilder);
+        assert_eq!(ctx.block_hash, None);
     }
 
     // ========================================================================

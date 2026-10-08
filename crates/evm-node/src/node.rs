@@ -24,6 +24,7 @@
 use crate::payload::ArcLocalPayloadAttributesBuilder;
 use alloy_network::Ethereum;
 use alloy_rpc_types_engine::ExecutionData;
+use arc_evm::execution_log::ExecutionLogSink;
 use arc_evm::{ArcEvmConfig, ArcEvmFactory};
 use arc_execution_validation::ArcConsensus;
 use reth_chainspec::{EthereumHardforks, Hardforks};
@@ -136,6 +137,7 @@ pub struct ArcNode {
     pub tx_relays: Vec<String>,
     /// Connection timeout for relays, and request timeout for async relayed submissions.
     pub tx_relay_timeout: std::time::Duration,
+    pub execution_log_sink: Option<Arc<dyn ExecutionLogSink>>,
 }
 
 impl ArcNode {
@@ -154,6 +156,7 @@ impl ArcNode {
             rebroadcast_interval: crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
             tx_relays: Vec::new(),
             tx_relay_timeout: DEFAULT_TX_RELAY_TIMEOUT,
+            execution_log_sink: None,
         }
     }
 
@@ -186,7 +189,14 @@ impl ArcNode {
             rebroadcast_interval,
             tx_relays,
             tx_relay_timeout,
+            execution_log_sink: None,
         }
+    }
+
+    /// Enable transaction execution observation for incoming Engine payloads.
+    pub fn with_execution_log_sink(mut self, sink: Arc<dyn ExecutionLogSink>) -> Self {
+        self.execution_log_sink = Some(sink);
+        self
     }
 
     /// Returns a [`ComponentsBuilder`] configured for a regular Arc node.
@@ -554,6 +564,9 @@ where
             self.wait_for_payload,
             self.rebroadcast_interval,
         )
+        .executor(ArcExecutorBuilder {
+            execution_log_sink: self.execution_log_sink.clone(),
+        })
     }
 
     fn add_ons(&self) -> Self::AddOns {
@@ -587,7 +600,9 @@ impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for ArcNode {
 /// A regular Arc evm and executor builder.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
-pub struct ArcExecutorBuilder;
+pub struct ArcExecutorBuilder {
+    execution_log_sink: Option<Arc<dyn ExecutionLogSink>>,
+}
 
 impl<Types, Node> ExecutorBuilder<Node> for ArcExecutorBuilder
 where
@@ -601,7 +616,11 @@ where
             ctx.chain_spec().clone(),
             ArcEvmFactory::new(ctx.chain_spec().clone()),
         );
-        Ok(ArcEvmConfig::new(evm_config))
+        let config = ArcEvmConfig::new(evm_config);
+        Ok(match self.execution_log_sink {
+            Some(sink) => config.with_execution_log_sink(sink),
+            None => config,
+        })
     }
 }
 

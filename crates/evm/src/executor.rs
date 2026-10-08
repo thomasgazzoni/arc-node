@@ -26,9 +26,10 @@ use reth_ethereum::{
     },
     provider::BlockExecutionResult,
 };
-use reth_evm::eth::EthBlockExecutionCtx;
 use revm::{context::Block, context_interface::result::ResultAndState};
 
+use crate::evm::{ArcBlockExecutionCtx, ArcExecutionOrigin};
+use crate::execution_log::{ExecutionLogEvent, ExecutionLogSink};
 use alloy_consensus::transaction::Transaction;
 use alloy_consensus::transaction::TransactionEnvelope;
 use alloy_consensus::TxReceipt;
@@ -57,6 +58,7 @@ use arc_precompiles::helpers::ERR_BLOCKED_ADDRESS;
 use arc_precompiles::system_accounting;
 use reth_evm::block::StateChangePostBlockSource;
 use revm::DatabaseCommit;
+use std::sync::Arc;
 
 const ERR_BLOCK_NUMBER_CONVERSION_FAILED: &str = "Failed to convert block number to u64";
 
@@ -69,6 +71,8 @@ pub struct ArcTxResult<H, T> {
     pub blob_gas_used: u64,
     /// Type of the transaction.
     pub tx_type: T,
+    /// Hash of the original transaction.
+    pub tx_hash: alloy_primitives::B256,
 }
 
 impl<H, T> TxResult for ArcTxResult<H, T>
@@ -93,7 +97,7 @@ where
 /// with modifications to support Arc-specific functionality.
 pub struct ArcBlockExecutor<'a, Evm, Spec, R: ReceiptBuilder> {
     /// Context for block execution.
-    pub ctx: EthBlockExecutionCtx<'a>,
+    pub ctx: ArcBlockExecutionCtx<'a>,
     /// Chain spec.
     chain_spec: Spec,
     /// Inner EVM.
@@ -127,6 +131,7 @@ pub struct ArcBlockExecutor<'a, Evm, Spec, R: ReceiptBuilder> {
     /// must surface that error instead of retrying after the hook has been detached and the
     /// sparse-trie root may already have been computed from the pre-error state.
     post_block_error: Option<BlockExecutionError>,
+    execution_log_sink: Option<Arc<dyn ExecutionLogSink>>,
 }
 
 impl<'a, Evm, Spec, R> ArcBlockExecutor<'a, Evm, Spec, R>
@@ -136,11 +141,16 @@ where
     Evm: alloy_evm::Evm,
 {
     /// Creates a new [`ArcBlockExecutor`]
-    pub fn new(evm: Evm, ctx: EthBlockExecutionCtx<'a>, spec: Spec, receipt_builder: R) -> Self {
+    pub fn new(
+        evm: Evm,
+        ctx: impl Into<ArcBlockExecutionCtx<'a>>,
+        spec: Spec,
+        receipt_builder: R,
+    ) -> Self {
         Self {
             chain_spec: spec.clone(),
             evm,
-            ctx,
+            ctx: ctx.into(),
             receipts: Vec::new(),
             gas_used: 0,
             blob_gas_used: 0,
@@ -149,7 +159,14 @@ where
             state_hook_active: false,
             post_block_applied: false,
             post_block_error: None,
+            execution_log_sink: None,
         }
+    }
+
+    /// Attach a bounded observer sink.
+    pub fn with_execution_log_sink(mut self, sink: Option<Arc<dyn ExecutionLogSink>>) -> Self {
+        self.execution_log_sink = sink;
+        self
     }
 
     /// Current block number as `u64`.
@@ -240,7 +257,7 @@ where
         // ADR-004: enforce extra_data matches what is computed, but only when executing an
         // existing payload (extra_data already set by consensus). During block building the
         // executor writes extra_data itself, so it is empty at this point — skip validation.
-        if !self.ctx.extra_data.is_empty() {
+        if !self.ctx.inner.extra_data.is_empty() {
             self.validate_extra_data_base_fee(block_number, gas_values.nextBaseFee)?;
         }
 
@@ -269,7 +286,7 @@ where
         block_number: u64,
         expected_next_base_fee: u64,
     ) -> Result<(), BlockExecutionError> {
-        let extra_data_base_fee = decode_base_fee_from_bytes(&self.ctx.extra_data);
+        let extra_data_base_fee = decode_base_fee_from_bytes(&self.ctx.inner.extra_data);
         if extra_data_base_fee != Some(expected_next_base_fee) {
             return Err(BlockExecutionError::Validation(BlockValidationError::Other(
                 format!(
@@ -375,7 +392,7 @@ where
         // EIP-2935: persist parent block hash in history storage contract.
         // Internally gates on Prague activation and is a no-op at block 0 (genesis).
         self.system_caller
-            .apply_blockhashes_contract_call(self.ctx.parent_hash, &mut self.evm)?;
+            .apply_blockhashes_contract_call(self.ctx.inner.parent_hash, &mut self.evm)?;
 
         let beneficiary = self.evm.block().beneficiary();
         validate_beneficiary_not_blocklisted(self.evm.db_mut(), beneficiary, block_number)?;
@@ -408,6 +425,7 @@ where
         tx: impl ExecutableTx<Self>,
     ) -> Result<Self::Result, BlockExecutionError> {
         let (tx_env, tx) = tx.into_parts();
+        let tx_hash = tx.tx().trie_hash();
 
         // The sum of the transaction's gas limit, Tg, and the gas utilized in this block prior,
         // must be no greater than the block's gasLimit.
@@ -438,6 +456,7 @@ where
             result,
             blob_gas_used: tx.tx().blob_gas_used().unwrap_or_default(),
             tx_type: tx.tx().tx_type(),
+            tx_hash,
         })
     }
 
@@ -446,6 +465,7 @@ where
             result: ResultAndState { result, state },
             blob_gas_used,
             tx_type,
+            tx_hash,
         } = output;
 
         self.system_caller
@@ -461,16 +481,45 @@ where
         // Cancun is always active for arc
         self.blob_gas_used = self.blob_gas_used.saturating_add(blob_gas_used);
 
-        self.receipts
-            .push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
-                tx_type,
-                evm: &self.evm,
-                result,
-                state: &state,
-                cumulative_gas_used: self.gas_used,
-            }));
+        let success = result.is_success();
+        let receipt = self.receipt_builder.build_receipt(ReceiptBuilderCtx {
+            tx_type,
+            evm: &self.evm,
+            result,
+            state: &state,
+            cumulative_gas_used: self.gas_used,
+        });
+
+        let tx_index = self.receipts.len() as u64;
+        let execution_event = match (
+            self.execution_log_sink
+                .as_ref()
+                .is_some_and(|sink| sink.wants_events()),
+            self.ctx.origin,
+            self.ctx.block_hash,
+        ) {
+            (true, ArcExecutionOrigin::EnginePayload, Some(block_hash)) => {
+                Some(ExecutionLogEvent {
+                    block_number: self.evm.block().number().to::<u64>(),
+                    block_hash,
+                    parent_hash: self.ctx.inner.parent_hash,
+                    block_timestamp: self.evm.block().timestamp().to::<u64>(),
+                    transaction_index: tx_index,
+                    transaction_hash: tx_hash,
+                    gas_used,
+                    success,
+                    logs: receipt.logs().to_vec(),
+                })
+            }
+            _ => None,
+        };
+        self.receipts.push(receipt);
 
         self.evm.db_mut().commit(state);
+
+        if let (Some(sink), Some(event)) = (&self.execution_log_sink, execution_event) {
+            sink.try_send(event);
+        }
 
         alloy_evm::block::GasOutput::new(gas_used)
     }
@@ -554,12 +603,14 @@ mod tests {
     use super::*;
 
     use reth_ethereum::evm::revm::db::State;
+    use reth_ethereum_primitives::TransactionSigned;
 
     use alloy_genesis::Genesis;
     use alloy_primitives::address;
     use alloy_primitives::map::HashMap;
     use alloy_primitives::B256 as AlloyB256;
     use alloy_primitives::KECCAK256_EMPTY;
+    use alloy_primitives::{Address as AlloyAddress, Log as AlloyLog};
     use arc_execution_config::hardforks::ArcHardfork;
     use reth_chainspec::{EthChainSpec, ForkCondition};
     use reth_evm::ConfigureEvm;
@@ -568,15 +619,106 @@ mod tests {
     use revm::{
         context::{BlockEnv, CfgEnv},
         database::InMemoryDB,
-        state::{AccountInfo, Bytecode, EvmState},
+        state::{Account, AccountInfo, Bytecode, EvmState},
     };
     use revm_primitives::ruint::aliases::U256;
     use revm_primitives::{hardfork::SpecId, keccak256};
     use revm_primitives::{StorageKey, StorageValue};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
 
     use arc_execution_config::chainspec::{
         localdev_with_hardforks, ArcChainSpec, BaseFeeConfigProvider, LOCAL_DEV,
     };
+
+    #[derive(Clone, Debug)]
+    struct TrackingDatabase {
+        db: std::sync::Arc<Mutex<InMemoryDB>>,
+    }
+
+    impl revm::Database for TrackingDatabase {
+        type Error = <InMemoryDB as revm::Database>::Error;
+
+        fn basic(&mut self, address: AlloyAddress) -> Result<Option<AccountInfo>, Self::Error> {
+            self.db.lock().unwrap().basic(address)
+        }
+
+        fn code_by_hash(&mut self, code_hash: AlloyB256) -> Result<Bytecode, Self::Error> {
+            self.db.lock().unwrap().code_by_hash(code_hash)
+        }
+
+        fn storage(
+            &mut self,
+            address: AlloyAddress,
+            index: StorageKey,
+        ) -> Result<StorageValue, Self::Error> {
+            self.db.lock().unwrap().storage(address, index)
+        }
+
+        fn block_hash(&mut self, number: u64) -> Result<AlloyB256, Self::Error> {
+            self.db.lock().unwrap().block_hash(number)
+        }
+    }
+
+    impl revm::DatabaseCommit for TrackingDatabase {
+        fn commit(&mut self, changes: alloy_primitives::map::AddressMap<revm::state::Account>) {
+            revm::DatabaseCommit::commit(&mut *self.db.lock().unwrap(), changes);
+        }
+    }
+
+    #[derive(Debug)]
+    struct CommitTracker<DB> {
+        db: DB,
+        committed: std::sync::Arc<AtomicBool>,
+    }
+
+    impl<DB: revm::Database> revm::Database for CommitTracker<DB> {
+        type Error = DB::Error;
+
+        fn basic(&mut self, address: AlloyAddress) -> Result<Option<AccountInfo>, Self::Error> {
+            self.db.basic(address)
+        }
+
+        fn code_by_hash(&mut self, code_hash: AlloyB256) -> Result<Bytecode, Self::Error> {
+            self.db.code_by_hash(code_hash)
+        }
+
+        fn storage(
+            &mut self,
+            address: AlloyAddress,
+            index: StorageKey,
+        ) -> Result<StorageValue, Self::Error> {
+            self.db.storage(address, index)
+        }
+
+        fn block_hash(&mut self, number: u64) -> Result<AlloyB256, Self::Error> {
+            self.db.block_hash(number)
+        }
+    }
+
+    impl<DB: revm::DatabaseCommit> revm::DatabaseCommit for CommitTracker<DB> {
+        fn commit(&mut self, changes: alloy_primitives::map::AddressMap<revm::state::Account>) {
+            self.db.commit(changes);
+            self.committed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingExecutionSink {
+        committed: std::sync::Arc<AtomicBool>,
+        events: Mutex<Vec<ExecutionLogEvent>>,
+        commits_before_callback: Mutex<Vec<bool>>,
+    }
+
+    impl ExecutionLogSink for RecordingExecutionSink {
+        fn try_send(&self, event: ExecutionLogEvent) {
+            self.commits_before_callback
+                .lock()
+                .unwrap()
+                .push(self.committed.load(Ordering::SeqCst));
+            self.events.lock().unwrap().push(event);
+        }
+    }
 
     // Build env from localdev genesis so ProtocolConfig is available
     pub fn insert_alloc_into_db(db: &mut InMemoryDB, genesis: &Genesis) {
@@ -644,6 +786,131 @@ mod tests {
             chain_spec.clone(),
             crate::evm::ArcEvmFactory::new(chain_spec),
         ))
+    }
+
+    fn mock_tx_result(
+        success: bool,
+        logs: Vec<AlloyLog>,
+        tx_hash: AlloyB256,
+    ) -> ArcTxResult<
+        revm::context_interface::result::HaltReason,
+        <TransactionSigned as TransactionEnvelope>::TxType,
+    > {
+        use revm::context_interface::result::{ExecutionResult, Output, ResultGas, SuccessReason};
+
+        let result = if success {
+            ExecutionResult::Success {
+                reason: SuccessReason::Stop,
+                gas: ResultGas::new(21_000, 0, 0),
+                logs,
+                output: Output::Call(Default::default()),
+            }
+        } else {
+            ExecutionResult::Revert {
+                gas: ResultGas::new(21_000, 0, 0),
+                logs,
+                output: Default::default(),
+            }
+        };
+        let mut state = EvmState::default();
+        let mut changed_account = Account::default();
+        changed_account.info.balance = U256::from(1);
+        changed_account.mark_touch();
+        state.insert(AlloyAddress::repeat_byte(0xaa), changed_account);
+        ArcTxResult {
+            result: ResultAndState { result, state },
+            blob_gas_used: 0,
+            tx_type: Default::default(),
+            tx_hash,
+        }
+    }
+
+    #[test]
+    fn engine_payload_emits_receipt_logs_after_commit_with_status_hash_and_index() {
+        let chain_spec = LOCAL_DEV.clone();
+        let evm_config = create_evm_config(chain_spec.clone());
+        let committed = std::sync::Arc::new(AtomicBool::new(false));
+        let sink = std::sync::Arc::new(RecordingExecutionSink {
+            committed: committed.clone(),
+            events: Mutex::new(Vec::new()),
+            commits_before_callback: Mutex::new(Vec::new()),
+        });
+        let database = TrackingDatabase {
+            db: std::sync::Arc::new(Mutex::new(InMemoryDB::default())),
+        };
+        let mut state = State::builder().with_database(database).build();
+        state.insert_account(AlloyAddress::repeat_byte(0xaa), AccountInfo::default());
+        let mut tracked_state = CommitTracker {
+            db: state,
+            committed: committed.clone(),
+        };
+        let cfg_env = CfgEnv::new()
+            .with_chain_id(chain_spec.chain_id())
+            .with_spec_and_mainnet_gas_params(SpecId::PRAGUE);
+        let evm_env = EvmEnv {
+            cfg_env,
+            block_env: BlockEnv {
+                number: U256::from(77),
+                timestamp: U256::from(123),
+                gas_limit: 30_000_000,
+                ..get_mock_block_env()
+            },
+        };
+        let evm = evm_config.evm_with_env(&mut tracked_state, evm_env);
+        let ctx = crate::evm::ArcBlockExecutionCtx {
+            inner: get_mock_execution_ctx(),
+            block_hash: Some(AlloyB256::repeat_byte(0x11)),
+            origin: ArcExecutionOrigin::EnginePayload,
+        };
+        let mut executor = ArcBlockExecutor::new(
+            evm,
+            ctx,
+            chain_spec.clone(),
+            evm_config.inner.executor_factory.receipt_builder(),
+        )
+        .with_execution_log_sink(Some(sink.clone()));
+
+        let log = AlloyLog {
+            address: AlloyAddress::repeat_byte(0x22),
+            data: alloy_primitives::LogData::new_unchecked(
+                vec![AlloyB256::repeat_byte(0x33)],
+                alloy_primitives::Bytes::from_static(b"arc"),
+            ),
+        };
+        let tx_hash = AlloyB256::repeat_byte(0x44);
+        executor.commit_transaction(mock_tx_result(true, vec![log], tx_hash));
+        executor.commit_transaction(mock_tx_result(
+            false,
+            Vec::new(),
+            AlloyB256::repeat_byte(0x55),
+        ));
+        executor.ctx.origin = ArcExecutionOrigin::BlockReexecution;
+        executor.commit_transaction(mock_tx_result(
+            true,
+            Vec::new(),
+            AlloyB256::repeat_byte(0x66),
+        ));
+        executor.ctx.origin = ArcExecutionOrigin::PayloadBuilder;
+        executor.commit_transaction(mock_tx_result(
+            true,
+            Vec::new(),
+            AlloyB256::repeat_byte(0x77),
+        ));
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].block_number, 77);
+        assert_eq!(events[0].block_hash, AlloyB256::repeat_byte(0x11));
+        assert_eq!(events[0].block_timestamp, 123);
+        assert_eq!(events[0].transaction_index, 0);
+        assert_eq!(events[0].transaction_hash, tx_hash);
+        assert!(events[0].success);
+        assert_eq!(events[0].logs, executor.receipts()[0].logs());
+        assert_eq!(events[1].transaction_index, 1);
+        assert_eq!(events[1].transaction_hash, AlloyB256::repeat_byte(0x55));
+        assert!(!events[1].success);
+        assert_eq!(events[1].logs, executor.receipts()[1].logs());
+        assert_eq!(*sink.commits_before_callback.lock().unwrap(), [true, true]);
     }
 
     fn mark_address_as_blocklisted(db: &mut InMemoryDB, beneficiary: Address) {
